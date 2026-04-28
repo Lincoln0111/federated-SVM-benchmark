@@ -1,0 +1,15 @@
+# Claude Code internal files
+.claude/
+CLAUDE.md
+
+# Dataset files (large binary/compressed — download via benchmark.py --download)
+data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Partial / fast-test results
+results_fast.csv
