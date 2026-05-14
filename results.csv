@@ -99,3 +99,4 @@ covtype,label_skew,50,fedavg_svm,0.5554,10.29,42
 covtype,label_skew,50,bdsvm,0.3998,11.8,42
 covtype,label_skew,50,fdr_svm,0.5555,11.81,42
 covtype,label_skew,50,fedssl_amc,0.401,1.57,42
+mnist_0_vs_others,standalone,1,bdsvm,0.9850,7.0,42
