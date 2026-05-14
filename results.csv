@@ -18,6 +18,7 @@ rcv1,dirichlet_a1.0,50,centralized,0.96115,0.23,42
 rcv1,dirichlet_a1.0,50,fedavg_svm,0.92455,110.55,42
 rcv1,dirichlet_a1.0,50,bdsvm,0.9533,137.98,42
 rcv1,dirichlet_a1.0,50,fdr_svm,0.9183,87.63,42
+mnist_0_vs_others,standalone,1,bdsvm,0.9850,7.0,42
 rcv1,dirichlet_a1.0,50,fedssl_amc,0.8888,23.95,42
 rcv1,dirichlet_a0.3,10,centralized,0.96115,0.12,42
 rcv1,dirichlet_a0.3,10,fedavg_svm,0.90815,12.95,42

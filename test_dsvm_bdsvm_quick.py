@@ -41,7 +41,7 @@ def irwls_dsvm(Kmn, y, C, Nmaxiter, tolerance):
 
         sv_mask = (hinge > 0).flatten()
         if sv_mask.sum() == 0:
-            print(f"   Iter {it+1}: No support vectors, cost={cost:.4f} 鈥?converged early")
+            print(f"   Iter {it+1}: No support vectors, cost={cost:.4f} — converged early")
             break
 
         clYC = sv_mask.astype(float).reshape(-1, 1) * C * (-Y)
@@ -59,7 +59,7 @@ def irwls_dsvm(Kmn, y, C, Nmaxiter, tolerance):
         w_new = w - delta
         diff = np.linalg.norm(w_new - w)
         w = w_new
-        print(f"   Iter {it+1}/{Nmaxiter}: cost={cost:.4f}, ||螖w||={diff:.6f}, SVs={sv_mask.sum()}")
+        print(f"   Iter {it+1}/{Nmaxiter}: cost={cost:.4f}, ||Δw||={diff:.6f}, SVs={sv_mask.sum()}")
 
         if diff < tolerance:
             print(f"   Converged at iteration {it+1}")
@@ -78,7 +78,7 @@ t0 = time.time()
 mnist = fetch_openml('mnist_784', version=1, as_frame=False, parser='auto')
 X_all = mnist.data.astype(np.float32) / 255.0
 y_raw = mnist.target.astype(int)
-print(f"  鉁?MNIST loaded: {X_all.shape[0]} samples, {X_all.shape[1]} features ({time.time()-t0:.1f}s)")
+print(f"  ✓ MNIST loaded: {X_all.shape[0]} samples, {X_all.shape[1]} features ({time.time()-t0:.1f}s)")
 
 print("\n[Step 2] Preprocessing (Digit 0 vs Others)...")
 y_all = np.where(y_raw == 0, 1, -1)
@@ -92,27 +92,27 @@ X_train, y_train = X_train_full[idx], y_train_full[idx]
 X_test, y_test = X_test_full[idx2], y_test_full[idx2]
 
 pos_tr = (y_train == 1).sum()
-print(f"  鉁?Train: {len(X_train)} samples ({pos_tr} positives, {len(X_train)-pos_tr} negatives)")
-print(f"  鉁?Test : {len(X_test)} samples")
+print(f"  ✓ Train: {len(X_train)} samples ({pos_tr} positives, {len(X_train)-pos_tr} negatives)")
+print(f"  ✓ Test : {len(X_test)} samples")
 
 print(f"\n[Step 3] Computing {NC} budget vectors via Mini-Batch K-Means...")
 t1 = time.time()
 km = MiniBatchKMeans(n_clusters=NC, random_state=42, max_iter=100, n_init=3)
 km.fit(X_train)
 centroids = km.cluster_centers_.astype(np.float32)
-print(f"  鉁?Centroids shape: {centroids.shape}  ({time.time()-t1:.1f}s)")
+print(f"  ✓ Centroids shape: {centroids.shape}  ({time.time()-t1:.1f}s)")
 
-print(f"\n[Step 4] Computing Gram (kernel) matrices 鈥?sigma={sigma}...")
+print(f"\n[Step 4] Computing Gram (kernel) matrices — sigma={sigma}...")
 t2 = time.time()
 Kmn_train = gaussian_kernel_matrix(X_train, centroids, sigma)
 Kmn_test = gaussian_kernel_matrix(X_test, centroids, sigma)
-print(f"  鉁?K_train shape: {Kmn_train.shape}")
-print(f"  鉁?K_test  shape: {Kmn_test.shape}  ({time.time()-t2:.1f}s)")
+print(f"  ✓ K_train shape: {Kmn_train.shape}")
+print(f"  ✓ K_test  shape: {Kmn_test.shape}  ({time.time()-t2:.1f}s)")
 
 print(f"\n[Step 5] IRWLS optimisation (C={C}, Nmaxiter={Nmaxiter})...")
 t3 = time.time()
 w, cost_history = irwls_dsvm(Kmn_train, y_train, C, Nmaxiter, tolerance)
-print(f"  鉁?Training done in {time.time()-t3:.1f}s")
+print(f"  ✓ Training done in {time.time()-t3:.1f}s")
 
 print("\n[Step 6] Evaluating model...")
 
@@ -152,5 +152,5 @@ print(f"  Total wall-clock time: {total_time:.1f}s")
 print(f"\n  Parameters: C={C}, sigma={sigma}, NC={NC}, Nmaxiter={Nmaxiter}")
 print(f"  Train size={len(X_train)}, Test size={len(X_test)}")
 print("=" * 60)
-print("  鉁?DSVM (BDSVM) test completed successfully!")
+print("  ✓ DSVM (BDSVM) test completed successfully!")
 print("=" * 60)
