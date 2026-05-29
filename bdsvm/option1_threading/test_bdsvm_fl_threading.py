@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""Threaded local federated simulation for POM1 DSVM/BDSVM on MNIST."""
+"""Threaded local federated simulation for POM1 DSVM/BDSVM on SDCA benchmark datasets.
+
+Supports: astro-ph | ccat | covtype
+
+Usage:
+    python test_bdsvm_fl_threading.py --dataset astro-ph
+    python test_bdsvm_fl_threading.py --dataset ccat
+    python test_bdsvm_fl_threading.py --dataset covtype
+"""
 
 from __future__ import annotations
 
+import argparse
 import copy
 import dataclasses
 import queue
@@ -11,12 +20,12 @@ import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from sklearn.datasets import fetch_openml
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold
 
 from MMLL.nodes.MasterNode import MasterNode
 from MMLL.nodes.WorkerNode import WorkerNode
+from data_utils.sdca_datasets import load_astro_ph, load_ccat, load_covtype
 
 
 class TimedOutException(Exception):
@@ -120,10 +129,10 @@ class MockComms_worker:
 @dataclasses.dataclass
 class SimulationConfig:
     n_workers: int = 3
-    nc: int = 50
-    nmaxiter: int = 12
+    nc: int = 200
+    nmaxiter: int = 15
     tolerance: float = 1e-4
-    sigma: float = 6.0
+    sigma: float = 1.0
     c_value: float = 1.0
     eps: float = 1e-5
     random_state: int = 42
@@ -136,30 +145,24 @@ class SimulationResult:
     worker_threads: List[threading.Thread]
 
 
-def load_mnist_binary(random_state: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load MNIST and produce train, validation, and test splits for digit 0 vs rest."""
-    print('Loading MNIST from sklearn OpenML...')
-    X, y = fetch_openml('mnist_784', version=1, return_X_y=True, as_frame=False, parser='auto')
-    X = X.astype(np.float32) / 255.0
-    y = y.astype(np.int64)
-    y_binary = np.where(y == 0, 1, -1).astype(np.int64)
+# ── Per-dataset configurations ────────────────────────────────────────────────
+# Sigma is the RBF bandwidth: K(x,z) = exp(-||x-z||^2 / (2*sigma^2)).
+# Median-heuristic: sigma ≈ median(||x-z||) / sqrt(2).
+#   covtype : 54 dims, LIBSVM-scaled [-1,1] → E[||x-z||^2] ≈ 36 → sigma ≈ 4-6
+#   SVD-200 : 200 dims, unit-scaled         → E[||x-z||^2] ≈ 400 → sigma ≈ 14
+# Near-balanced datasets (covtype 49/51%) need high C and more iterations to
+# escape the β≈0 fixed point (initial IRWLS gradient K^T y is small).
+DATASET_CONFIGS: Dict[str, SimulationConfig] = {
+    'astro-ph': SimulationConfig(n_workers=3, nc=200, nmaxiter=20, sigma=14.0, c_value=1.0),
+    'ccat':     SimulationConfig(n_workers=3, nc=200, nmaxiter=20, sigma=14.0, c_value=1.0),
+    'covtype':  SimulationConfig(n_workers=3, nc=200, nmaxiter=30, sigma=2.0,  c_value=50.0),
+}
 
-    X_train_full, X_test, y_train_full, y_test = train_test_split(
-        X,
-        y_binary,
-        test_size=10000,
-        random_state=random_state,
-        stratify=y_binary,
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train_full,
-        y_train_full,
-        test_size=6000,
-        random_state=random_state,
-        stratify=y_train_full,
-    )
-    print(f'Train samples: {X_train.shape[0]}, validation samples: {X_val.shape[0]}, test samples: {X_test.shape[0]}')
-    return X_train, y_train, X_val, y_val, X_test, y_test
+DATASET_LOADERS = {
+    'astro-ph': load_astro_ph,
+    'ccat':     load_ccat,
+    'covtype':  load_covtype,
+}
 
 
 def split_iid_among_workers(
@@ -232,6 +235,7 @@ def start_worker_threads(
     partitions: Sequence[Tuple[np.ndarray, np.ndarray]],
     bus: ThreadedMessageBus,
     logger: NullLogger,
+    dataset_name: str = 'sdca',
 ) -> Tuple[List[WorkerNode], List[threading.Thread], queue.Queue[Tuple[str, BaseException]]]:
     """Create workers, attach local partitions, and start their execution threads."""
     worker_nodes: List[WorkerNode] = []
@@ -242,7 +246,7 @@ def start_worker_threads(
         worker_id = f'worker_{worker_idx + 1}'
         worker_comms = MockComms_worker(bus, worker_id, logger)
         worker_node = WorkerNode(pom=1, comms=worker_comms, logger=logger, verbose=True)
-        worker_node.set_training_data('mnist_binary', Xtr=x_part, ytr=y_part)
+        worker_node.set_training_data(dataset_name, Xtr=x_part, ytr=y_part)
         worker_node.create_model_worker('DSVM')
 
         def worker_target(node: WorkerNode = worker_node, current_worker_id: str = worker_id) -> None:
@@ -265,15 +269,21 @@ def run_threaded_simulation(
     X_val: np.ndarray,
     y_val: np.ndarray,
     config: SimulationConfig,
+    dataset_name: str = 'sdca',
 ) -> SimulationResult:
     """Run an unchanged MMLL DSVM training session over queue-backed comms."""
     worker_ids = [f'worker_{index + 1}' for index in range(len(train_partitions))]
     bus = ThreadedMessageBus(worker_ids)
     logger = NullLogger()
 
-    _, worker_threads, error_queue = start_worker_threads(train_partitions, bus, logger)
+    _, worker_threads, error_queue = start_worker_threads(train_partitions, bus, logger, dataset_name)
 
     all_train_x = np.vstack([part[0] for part in train_partitions])
+    # Use percentiles so initial centroids land near the actual data cloud.
+    # Using global min/max places centroids in empty high-dimensional space,
+    # making all kernel values ≈ 0 and preventing learning.
+    init_min = float(np.percentile(all_train_x, 1))
+    init_max = float(np.percentile(all_train_x, 99))
     master_comms = MockComms_master(bus, worker_ids, logger)
     master_node = MasterNode(pom=1, comms=master_comms, logger=logger, verbose=True, NI=all_train_x.shape[1])
     master_node.create_model_Master(
@@ -286,8 +296,8 @@ def run_threaded_simulation(
             'C': config.c_value,
             'eps': config.eps,
             'NI': all_train_x.shape[1],
-            'minvalue': float(all_train_x.min()),
-            'maxvalue': float(all_train_x.max()),
+            'minvalue': init_min,
+            'maxvalue': init_max,
         },
     )
 
@@ -329,19 +339,32 @@ def run_threaded_simulation(
 
 
 def main() -> int:
-    config = SimulationConfig()
-    X_train, y_train, X_val, y_val, X_test, y_test = load_mnist_binary(config.random_state)
+    ap = argparse.ArgumentParser(
+        description='Threaded federated DSVM on SDCA benchmark datasets.'
+    )
+    ap.add_argument(
+        '--dataset', choices=list(DATASET_CONFIGS), default='astro-ph',
+        help='Dataset to run (default: astro-ph)',
+    )
+    args = ap.parse_args()
+
+    dataset = args.dataset
+    config = DATASET_CONFIGS[dataset]
+    loader = DATASET_LOADERS[dataset]
+
+    print(f'\n=== BDSVM Option 1 threading – dataset: {dataset} ===')
+    X_train, y_train, X_val, y_val, X_test, y_test = loader(random_state=config.random_state)
 
     federated_partitions = split_iid_among_workers(X_train, y_train, config.n_workers, config.random_state)
-    print(f'\nStarting threaded federated DSVM with {config.n_workers} workers...')
-    federated_result = run_threaded_simulation(federated_partitions, X_val, y_val, config)
+    print(f'\nStarting threaded federated DSVM on {dataset} with {config.n_workers} workers...')
+    federated_result = run_threaded_simulation(federated_partitions, X_val, y_val, config, dataset)
     federated_metrics = compute_metrics(federated_result.model, X_test, y_test)
-    print_metrics('Federated DSVM (3 workers)', federated_metrics, federated_result.fit_seconds)
+    print_metrics(f'Federated DSVM – {dataset} ({config.n_workers} workers)', federated_metrics, federated_result.fit_seconds)
 
     print('\nStarting centralized-equivalent DSVM baseline (single worker over full data)...')
-    centralized_result = run_threaded_simulation([(X_train, y_train)], X_val, y_val, config)
+    centralized_result = run_threaded_simulation([(X_train, y_train)], X_val, y_val, config, dataset)
     centralized_metrics = compute_metrics(centralized_result.model, X_test, y_test)
-    print_metrics('Centralized-equivalent DSVM (1 worker)', centralized_metrics, centralized_result.fit_seconds)
+    print_metrics(f'Centralized-equivalent DSVM – {dataset} (1 worker)', centralized_metrics, centralized_result.fit_seconds)
 
     accuracy_gap = centralized_metrics['accuracy'] - federated_metrics['accuracy']
     print('\nComparison')
@@ -350,8 +373,8 @@ def main() -> int:
     print(f'Centralized accuracy : {centralized_metrics["accuracy"]:.4f}')
     print(f'Accuracy gap         : {accuracy_gap:+.4f}')
 
-    if federated_metrics['accuracy'] < 0.95:
-        print('\nWARNING: Federated accuracy is below the 95% target.')
+    if federated_metrics['accuracy'] < 0.85:
+        print(f'\nWARNING: Federated accuracy {federated_metrics["accuracy"]:.4f} is below the 85% target.')
         return 1
 
     return 0
