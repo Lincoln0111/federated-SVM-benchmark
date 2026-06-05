@@ -46,6 +46,8 @@ _ASTRO_PH_URLS = [
 _RCV1_TRAIN_URL = f"{_LIBSVM_BASE}/rcv1_train.binary.bz2"
 _RCV1_TEST_URL = f"{_LIBSVM_BASE}/rcv1_test.binary.bz2"
 _COVTYPE_URL = f"{_LIBSVM_BASE}/covtype.libsvm.binary.scale.bz2"
+# real-sim: 72,309 samples, 20,958 sparse features — used as astro-ph fallback
+_REAL_SIM_URL = f"{_LIBSVM_BASE}/real-sim.bz2"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -169,21 +171,38 @@ def load_astro_ph(
         train_dat = extract_dir / "example3" / "train.dat"
         test_dat = extract_dir / "example3" / "test.dat"
 
-        _download_first_working([_ASTRO_PH_URLS[1]], tgz_path)
+        # Joachims tar.gz fallback
+        joachims_ok = False
+        try:
+            _download_first_working([_ASTRO_PH_URLS[1]], tgz_path)
 
-        if not train_dat.exists():
-            print("[extract] svmperf_example3.tar.gz ...")
-            extract_dir.mkdir(parents=True, exist_ok=True)
-            with tarfile.open(tgz_path, "r:gz") as tf:
-                tf.extractall(extract_dir)
+            if not train_dat.exists():
+                print("[extract] svmperf_example3.tar.gz ...")
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(tgz_path, "r:gz") as tf:
+                    tf.extractall(extract_dir)
 
-        print("[load] astro-ph train.dat + test.dat ...")
-        X_tr_sp, y_tr = load_svmlight_file(str(train_dat))
-        X_te_sp, y_te = load_svmlight_file(str(test_dat), n_features=X_tr_sp.shape[1])
-        y_tr = _normalize_labels(y_tr)
-        y_te = _normalize_labels(y_te)
-        X_all_sp = scipy.sparse.vstack([X_tr_sp, X_te_sp])
-        y_all = np.concatenate([y_tr, y_te])
+            print("[load] astro-ph train.dat + test.dat ...")
+            X_tr_sp, y_tr = load_svmlight_file(str(train_dat))
+            X_te_sp, y_te = load_svmlight_file(str(test_dat), n_features=X_tr_sp.shape[1])
+            y_tr = _normalize_labels(y_tr)
+            y_te = _normalize_labels(y_te)
+            X_all_sp = scipy.sparse.vstack([X_tr_sp, X_te_sp])
+            y_all = np.concatenate([y_tr, y_te])
+            joachims_ok = True
+        except Exception as e:
+            print(f"[warn] Joachims astro-ph not available: {e}")
+
+        if not joachims_ok:
+            # Final fallback: real-sim (72k samples, 20k sparse features)
+            # Structural substitute for astro-ph — sparse binary text classification.
+            print("[fallback] astro-ph unavailable (both URLs 404). Using real-sim dataset.")
+            print("[fallback] real-sim: 72,309 samples, 20,958 features (binary newsgroup text)")
+            real_sim_path = data_dir / "real-sim.bz2"
+            _download(_REAL_SIM_URL, real_sim_path)
+            print("[load] real-sim ...")
+            X_all_sp, y_all = load_svmlight_file(str(real_sim_path))
+            y_all = _normalize_labels(y_all)
 
     X_tmp, X_test_sp, y_tmp, y_test = train_test_split(
         X_all_sp, y_all, test_size=0.10, random_state=random_state, stratify=y_all
@@ -196,13 +215,15 @@ def load_astro_ph(
         X_train_sp, X_val_sp, X_test_sp, n_svd_components, random_state
     )
 
-    scaler = StandardScaler(with_mean=False)
+    # Center SVD components so centroids initialize symmetrically around data cloud.
+    scaler = StandardScaler(with_mean=True, with_std=True)
     X_train = scaler.fit_transform(X_train).astype(np.float32)
     X_val = scaler.transform(X_val).astype(np.float32)
     X_test = scaler.transform(X_test).astype(np.float32)
 
+    dataset_label = "astro-ph" if (bz2_path.exists() or tgz_path.exists()) else "real-sim"
     print(
-        f"[astro-ph] Train: {X_train.shape[0]:,}  Val: {X_val.shape[0]:,}  "
+        f"[{dataset_label}] Train: {X_train.shape[0]:,}  Val: {X_val.shape[0]:,}  "
         f"Test: {X_test.shape[0]:,}  Dim: {X_train.shape[1]}"
     )
     return X_train, y_train, X_val, y_val, X_test, y_test
