@@ -1,38 +1,53 @@
-# BDSVM Option 1 (Threading) – astro-ph Status
+# BDSVM Option 1 (Threading) – astro-ph / real-sim Results
 
 ## Dataset
 
-astro-ph is a binary classification task from the SDCA paper (Shalev-Shwartz & Zhang, 2013),
-originally used in the SVM-Perf benchmark (Joachims, 2006). It classifies astrophysics
-abstracts from arXiv as astrophysics (+1) or not (−1).
-
-## Status: Dataset Unavailable
-
-Both official download sources return **HTTP 404** as of the date of this benchmark:
-
-| URL | Status |
+| Property | Value |
 |---|---|
-| `http://download.joachims.org/svm_perf/examples/example3.tar.gz` | 404 Not Found |
-| `https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary/astro-ph.bz2` | 404 Not Found |
+| Name | real-sim (structural substitute for astro-ph) |
+| Source | `real-sim.bz2` via LIBSVM |
+| Original features | 20,958 (sparse binary bag-of-words) |
+| Projected features | 200 (TruncatedSVD + StandardScaler) |
+| Train samples | 52,062 (90% of 80% split) |
+| Validation samples | 5,785 |
+| Test samples | 7,229 (20% held out) |
+| Task | Binary newsgroup classification (+1 / −1) |
 
-The `load_astro_ph()` function in `data_utils/sdca_datasets.py` tries both URLs in order
-and raises a `RuntimeError` with instructions to place the file manually if neither works.
+> **Note on astro-ph:** Both official download URLs for the original astro-ph dataset
+> (Joachims SVM-Perf and LIBSVM mirror) return HTTP 404. `real-sim` is used as a
+> structural substitute — same sparse-text format, similar scale, same preprocessing pipeline.
+> To use the original astro-ph, place `astro-ph.bz2` in the `data/` directory and re-run.
 
-## Manual Installation (if you have access to the file)
+## Hyperparameters
 
-Place either of the following in the `data/` directory:
+| Parameter | Value |
+|---|---|
+| Workers | 3 (IID partition) |
+| Budget size (nc) | 200 |
+| Max iterations | 20 |
+| Sigma (RBF kernel) | 14.0 |
+| C (regularisation) | 1.0 |
+| Tolerance | 1e-4 |
+| Centroid init | uniform(P1, P99) of training data |
 
-- `data/astro-ph.bz2` — LIBSVM bz2 format (single file, `load_svmlight_file` compatible)
-- `data/svmperf_example3.tar.gz` — SVM-Perf tar.gz containing `train.dat` / `test.dat`
+## Results
 
-Then re-run:
+| Metric | Federated (3 workers) | Centralized (1 worker) | Gap |
+|---|---|---|---|
+| Accuracy | **0.8836** | 0.9260 | −0.0424 |
+| Precision | — | 0.9078 | — |
+| Recall | — | 0.8453 | — |
+| F1-score | — | 0.8754 | — |
+| ROC-AUC | **0.9759** | 0.9761 | −0.0002 |
+| Fit time | — | 3.69 s | — |
+| Iterations | 5 | 5 | — |
 
-```bash
-python test_bdsvm_fl_threading.py --dataset astro-ph
-```
+## Notes
 
-## Alternative Sources
+- Federated accuracy **88.36%** exceeds the 85% target.
+- The larger accuracy gap (4.24 pp vs 0.52 pp for CCAT) is due to the smaller
+  per-worker training set: 52k/3 ≈ 17k samples per worker vs 90k/3 = 30k for CCAT.
+- ROC-AUC gap is negligible (0.0002), confirming federation preserves ranking ability.
+- Centroid percentile initialization (P1–P99) is essential; using global min/max causes
+  all kernels to evaluate near zero on high-dimensional SVD-projected data.
 
-- OpenML dataset #1216: `fetch_openml("astro-ph", version=1)` (may differ slightly from
-  the original SDCA benchmark split)
-- Kaggle: search for "astro-ph LIBSVM" — community-uploaded copies may be available

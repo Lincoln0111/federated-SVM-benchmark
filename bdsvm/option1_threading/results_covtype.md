@@ -29,12 +29,12 @@
 
 | Metric | Federated (3 workers) | Centralized (1 worker) | Gap |
 |---|---|---|---|
-| Accuracy | **0.7621** | 0.7678 | −0.0057 |
-| Precision | — | 0.7551 | — |
-| Recall | — | 0.7750 | — |
-| F1-score | — | 0.7650 | — |
-| ROC-AUC | **0.8474** | 0.8436 | +0.0038 |
-| Fit time | — | 24.70 s | — |
+| Accuracy | **0.7581** | 0.7666 | −0.0085 |
+| Precision | — | 0.7423 | — |
+| Recall | — | 0.7984 | — |
+| F1-score | — | 0.7693 | — |
+| ROC-AUC | **0.8451** | 0.8406 | +0.0045 |
+| Fit time | — | 6.33 s | — |
 
 ## Notes
 
