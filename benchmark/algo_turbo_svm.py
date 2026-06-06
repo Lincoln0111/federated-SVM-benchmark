@@ -66,6 +66,12 @@ def turbo_server_aggregate(embeddings, labels_per_client, n_workers, C_svm=1.0):
         return E.mean(axis=0).astype(np.float32), np.arange(E.shape[0]), True
 
 
+def stabilize_global_weight(prev_w_global, w_selected, momentum=0.9):
+    if prev_w_global is None:
+        return w_selected.astype(np.float32)
+    return (momentum * prev_w_global + (1.0 - momentum) * w_selected).astype(np.float32)
+
+
 def run_turbo_svm(
     X_train,
     y_train,
@@ -83,6 +89,7 @@ def run_turbo_svm(
     parts = iid_partitions(Xtr, y_train, n_workers=n_workers, random_state=random_state)
 
     w_global = None
+    prev_w_global = None
     history = []
 
     for t in range(1, rounds + 1):
@@ -100,12 +107,14 @@ def run_turbo_svm(
             embeddings.append(coef)
 
         dom_labels = [float(np.mean(yk == 1)) for _, yk in parts]
-        w_global, sv_idx, used_fallback = turbo_server_aggregate(
+        w_selected, sv_idx, used_fallback = turbo_server_aggregate(
             embeddings,
             dom_labels,
             n_workers=len(parts),
             C_svm=C,
         )
+        w_global = stabilize_global_weight(prev_w_global, w_selected, momentum=0.9)
+        prev_w_global = w_global.copy()
 
         d = Xte.shape[1]
         w_vec = w_global[:d]

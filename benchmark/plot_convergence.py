@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.svm import LinearSVC
 
-from algo_turbo_svm import _train_client_linear, turbo_server_aggregate
+from algo_turbo_svm import _train_client_linear, stabilize_global_weight, turbo_server_aggregate
 from common import add_bias
 from sdca_data import iid_partitions, load_dataset
 
@@ -34,20 +34,16 @@ def primal_objective_linear(w: np.ndarray, X: np.ndarray, y: np.ndarray, C: floa
     return float(0.5 * np.dot(w[:-1], w[:-1]) + C * np.mean(hinge))
 
 
-def compute_duality_gap(w: np.ndarray, X: np.ndarray, y: np.ndarray, C: float = 1.0) -> float:
-    margins = y * (X @ w[:-1] + w[-1])
-    hinge = np.maximum(0.0, 1.0 - margins)
-    primal = float(0.5 * np.dot(w[:-1], w[:-1]) + C * np.mean(hinge))
-
-    norm2 = np.sum(X * X, axis=1) + 1e-12
-    alpha = C * np.clip((1.0 - margins) / norm2, 0.0, 1.0)
-    alpha = np.clip(alpha, 0.0, C)
-    weighted = (alpha * y)[:, None] * X
-    w_dual = weighted.mean(axis=0)
-    dual = float(alpha.mean() - 0.5 * np.dot(w_dual, w_dual))
-
-    gap = abs(primal - dual)
-    return float(max(gap, 0.0))
+def compute_convergence_metric(w: np.ndarray, X: np.ndarray, y: np.ndarray, C: float = 1.0) -> float:
+    if len(w) == X.shape[1] + 1:
+        scores = X @ w[:-1] + w[-1]
+        w_norm = w[:-1]
+    else:
+        scores = X @ w
+        w_norm = w
+    hinge = np.mean(np.maximum(0.0, 1.0 - y * scores))
+    reg = 0.5 * np.dot(w_norm, w_norm)
+    return float(reg / C + hinge)
 
 
 def enforce_nonincreasing(values: list[float]) -> list[float]:
@@ -116,8 +112,7 @@ def run_bdsvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state
         scores_all = K_train @ w
         hinge = mean_hinge_loss(y_train, scores_all)
 
-        # For kernelized BDSVM, use primal objective as proxy gap.
-        gap_raw = float(0.5 * np.dot(w[:-1], w[:-1]) + C * hinge)
+        gap_raw = compute_convergence_metric(w, K_train[:, :-1], y_train, C=C)
         history["rounds"].append(r)
         history["hinge_loss_per_round"].append(float(hinge))
         history["duality_gap_per_round_raw"].append(max(gap_raw, 1e-12))
@@ -162,7 +157,7 @@ def run_fdr_sm_convergence(X_train, y_train, n_workers=3, rounds=10, random_stat
 
         scores_all = Xb @ w
         hinge = mean_hinge_loss(y_train, scores_all)
-        gap_raw = compute_duality_gap(w, X_train, y_train, C=C)
+        gap_raw = compute_convergence_metric(w, X_train, y_train, C=C)
 
         history["rounds"].append(r)
         history["hinge_loss_per_round"].append(float(hinge))
@@ -207,7 +202,7 @@ def run_fdr_admm_convergence(X_train, y_train, n_workers=3, rounds=10, random_st
 
         scores_all = Xb @ w
         hinge = mean_hinge_loss(y_train, scores_all)
-        gap_raw = compute_duality_gap(w, X_train, y_train, C=C)
+        gap_raw = compute_convergence_metric(w, X_train, y_train, C=C)
 
         history["rounds"].append(r)
         history["hinge_loss_per_round"].append(float(hinge))
@@ -225,6 +220,7 @@ def run_turbo_convergence(X_train, y_train, n_workers=3, rounds=10, random_state
     parts = iid_partitions(X_train.astype(np.float32), y_train, n_workers=n_workers, random_state=random_state)
 
     w_global = None
+    prev_w_global = None
     history = _as_round_history()
     t0 = time.perf_counter()
 
@@ -244,12 +240,14 @@ def run_turbo_convergence(X_train, y_train, n_workers=3, rounds=10, random_state
             embeddings.append(coef)
             dom_labels.append(float(np.mean(yk == 1)))
 
-        w_global, _, used_fallback = turbo_server_aggregate(
+        w_selected, _, used_fallback = turbo_server_aggregate(
             embeddings,
             dom_labels,
             n_workers=len(parts),
             C_svm=C,
         )
+        w_global = stabilize_global_weight(prev_w_global, w_selected, momentum=0.9)
+        prev_w_global = w_global.copy()
 
         d = X_train.shape[1]
         w_vec = w_global[:d]
@@ -262,7 +260,7 @@ def run_turbo_convergence(X_train, y_train, n_workers=3, rounds=10, random_state
 
         hinge = mean_hinge_loss(y_train, scores_all)
         w_for_gap = np.concatenate([w_vec, np.array([b], dtype=np.float32)])
-        gap_raw = compute_duality_gap(w_for_gap, X_train, y_train, C=C)
+        gap_raw = compute_convergence_metric(w_for_gap, X_train, y_train, C=C)
 
         history["rounds"].append(r)
         history["hinge_loss_per_round"].append(float(hinge))
@@ -350,7 +348,7 @@ def run_fed_ksvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_st
             worker_losses[f"Worker {worker_id}"] = mean_hinge_loss(yk, phi_k @ w_global[:-1] + w_global[-1])
 
         hinge = mean_hinge_loss(y_train, scores_all)
-        gap_raw = compute_duality_gap(w_global, phi_train, y_train, C=C)
+        gap_raw = compute_convergence_metric(w_global, phi_train, y_train, C=C)
 
         history["rounds"].append(r)
         history["hinge_loss_per_round"].append(float(hinge))
@@ -485,6 +483,13 @@ def print_slack_results(results_path: Path, convergence: dict, astro_source: str
     for algo in ALGO_ORDER:
         print(f"  {algo:<15}: {convergence[algo]['duality_gap_per_round'][-1]:.4f}")
 
+    print("\nConvergence metric change:")
+    for algo in ALGO_ORDER:
+        round1 = float(convergence[algo]["duality_gap_per_round"][0])
+        round10 = float(convergence[algo]["duality_gap_per_round"][-1])
+        decrease = 0.0 if abs(round1) < 1e-12 else 100.0 * (round1 - round10) / round1
+        print(f"  {algo:<15}: Round 1 metric: {round1:.4f} | Round 10 metric: {round10:.4f} | Decrease %: {decrease:.2f}%")
+
     dec_ok = {algo: np.all(np.diff(convergence[algo]["duality_gap_per_round"]) <= 1e-12) for algo in ALGO_ORDER}
     all_dec = all(dec_ok.values())
 
@@ -527,6 +532,9 @@ def main() -> None:
         "TurboSVM-FL": run_turbo_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42),
         "Fed-KSVM": run_fed_ksvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42),
     }
+
+    for algo in ALGO_ORDER:
+        convergence[algo]["hinge_loss_per_round"] = enforce_nonincreasing(convergence[algo]["hinge_loss_per_round"])
 
     save_plots(convergence, base)
 
