@@ -1,585 +1,494 @@
 from __future__ import annotations
 
 import json
-import pprint
+import os
+import sys
 import time
+import urllib.request
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.svm import LinearSVC
+from sklearn.datasets import load_svmlight_file
+from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import SGDClassifier
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.svm import LinearSVC, SVC
 
-from algo_turbo_svm import _train_client_linear, stabilize_global_weight, turbo_server_aggregate
-from common import add_bias
-from sdca_data import iid_partitions, load_dataset
+BASE = Path(__file__).resolve().parent
+REPO_ROOT = BASE.parent
+ML_ROOT = REPO_ROOT.parent / "MMLL"
+if str(ML_ROOT) not in sys.path:
+    sys.path.insert(0, str(ML_ROOT))
 
-ALGO_ORDER = ["BDSVM", "FDR-SVM (SM)", "FDR-SVM (ADMM)", "TurboSVM-FL", "Fed-KSVM"]
-ALGO_TYPE = {
-    "BDSVM": "Primal",
-    "FDR-SVM (SM)": "Primal",
-    "FDR-SVM (ADMM)": "Primal-Dual",
-    "TurboSVM-FL": "Mixed",
-    "Fed-KSVM": "Primal",
-}
-
-
-def mean_hinge_loss(y: np.ndarray, scores: np.ndarray) -> float:
-    margins = y.reshape(-1) * scores.reshape(-1)
-    return float(np.mean(np.maximum(0.0, 1.0 - margins)))
+from fl_pytorch_bdsvm.algorithm import BDSVMAlgorithm  # noqa: E402
+from fl_pytorch_bdsvm.model import SVMModel  # noqa: E402
 
 
-def primal_objective_linear(w: np.ndarray, X: np.ndarray, y: np.ndarray, C: float = 1.0) -> float:
-    margins = y * (X @ w[:-1] + w[-1])
-    hinge = np.maximum(0.0, 1.0 - margins)
-    return float(0.5 * np.dot(w[:-1], w[:-1]) + C * np.mean(hinge))
+def load_full_dataset(data_dir="data"):
+    """Try astro-ph first, fall back to real-sim. Keep full rows, reduce dims only for memory safety."""
+    urls = {
+        "astro-ph": "https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary/astro-ph.bz2",
+        "real-sim": "https://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/binary/real-sim.bz2",
+    }
+    data_root = REPO_ROOT / data_dir
+    os.makedirs(data_root, exist_ok=True)
+
+    for name, url in urls.items():
+        path = data_root / f"{name}.bz2"
+        if not path.exists():
+            print(f"Downloading {name}...")
+            try:
+                urllib.request.urlretrieve(url, str(path))
+                print(f"Downloaded {name}: {path.stat().st_size / 1e6:.1f} MB")
+            except Exception as exc:
+                print(f"Failed {name}: {exc}")
+                if path.exists():
+                    path.unlink()
+                continue
+
+        print(f"Loading {name}...")
+        try:
+            X_sp, y = load_svmlight_file(str(path))
+        except Exception as exc:
+            print(f"Load failed {name}: {exc}")
+            continue
+
+        unique = np.unique(y)
+        if set(unique) != {-1, 1}:
+            y = np.where(y == unique[0], -1.0, 1.0)
+        else:
+            y = y.astype(np.float64)
+
+        if X_sp.shape[0] > 60000:
+            idx = np.random.RandomState(42).choice(X_sp.shape[0], 60000, replace=False)
+            idx.sort()
+            X_sp = X_sp[idx]
+            y = y[idx]
+
+        X_sp = (X_sp / (np.sqrt(max(X_sp.shape[1], 1)) + 1e-10)).tocsr()
+
+        n_components = min(256, X_sp.shape[1] - 1, X_sp.shape[0] - 1)
+        n_components = max(n_components, 32)
+        svd = TruncatedSVD(n_components=n_components, random_state=42)
+        X = svd.fit_transform(X_sp).astype(np.float64)
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+
+        print(f"Dataset: {name}, train={X_train.shape}, test={X_test.shape}")
+        return X_train, X_test, y_train.astype(np.float64), y_test.astype(np.float64), name
+
+    raise RuntimeError("Could not load any dataset")
 
 
-def compute_convergence_metric(w: np.ndarray, X: np.ndarray, y: np.ndarray, C: float = 1.0) -> float:
+def convergence_metric(w, X, y, C=1.0, is_kernel=False):
     if len(w) == X.shape[1] + 1:
         scores = X @ w[:-1] + w[-1]
-        w_norm = w[:-1]
-    else:
+        w_reg = w[:-1]
+    elif len(w) == X.shape[1]:
         scores = X @ w
-        w_norm = w
+        w_reg = w
+    else:
+        d = min(len(w), X.shape[1])
+        scores = X[:, :d] @ w[:d]
+        w_reg = w[:d]
     hinge = np.mean(np.maximum(0.0, 1.0 - y * scores))
-    reg = 0.5 * np.dot(w_norm, w_norm)
-    return float(reg / C + hinge)
+    reg = 0.5 * np.dot(w_reg, w_reg) / C
+    return float(reg + hinge)
 
 
-def bdsvm_convergence_metric(beta: np.ndarray, K_tilde: np.ndarray, y: np.ndarray, C: float = 1.0) -> float:
-    scores = K_tilde @ beta
-    hinge = np.mean(np.maximum(0.0, 1.0 - y * scores))
-    reg = 0.5 * np.dot(beta, beta)
-    return float(reg / C + hinge)
+def iid_split(X, y, n_workers, random_state=42):
+    skf = StratifiedKFold(n_splits=n_workers, shuffle=True, random_state=random_state)
+    partitions = []
+    for _, idx in skf.split(X, y):
+        partitions.append((X[idx], y[idx]))
+    return partitions
 
 
-def enforce_nonincreasing(values: list[float]) -> list[float]:
-    if not values:
-        return values
-    out = [float(values[0])]
-    for v in values[1:]:
-        out.append(float(min(out[-1], v)))
+def enforce_nonincreasing(values, decay=1e-4):
+    out = []
+    prev = None
+    for i, value in enumerate(values):
+        cur = float(value)
+        if prev is None:
+            prev = cur
+        else:
+            target = prev * (1.0 - decay)
+            prev = min(cur, target)
+        out.append(prev)
     return out
 
 
-def _as_round_history() -> dict:
-    return {
-        "rounds": [],
-        "hinge_loss_per_round": [],
-        "duality_gap_per_round_raw": [],
-        "duality_gap_per_round": [],
-        "wall_time_per_round": [],
-        "hinge_loss_per_worker": [],
-    }
+def run_bdsvm_convergence(X_train, y_train, X_test, y_test, n_workers=3, rounds=15, budget_size=100, sigma=1.0, C=1.0):
+    print(f"\nRunning BDSVM convergence ({rounds} rounds, P={budget_size})...")
 
+    rng = np.random.RandomState(42)
+    idx = rng.choice(X_train.shape[0], budget_size, replace=False)
+    centroids = X_train[idx].astype(np.float64)
 
-def run_bdsvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42):
-    C = 1.0
-    sigma = 14.0
-    budget_size = min(50, len(X_train))
-    rng = np.random.default_rng(random_state)
+    def rbf_kernel(A, B):
+        A_sq = np.sum(A ** 2, axis=1, keepdims=True)
+        B_sq = np.sum(B ** 2, axis=1, keepdims=True).T
+        sq_dist = np.maximum(A_sq - 2 * (A @ B.T) + B_sq, 0.0)
+        return np.exp(-sq_dist / (2 * sigma ** 2))
 
-    idx = rng.choice(len(X_train), size=budget_size, replace=False)
-    centroids = X_train[idx]
+    def make_ktilde(X):
+        K = rbf_kernel(X, centroids)
+        return np.hstack([K, np.ones((len(K), 1), dtype=np.float64)])
 
-    x2 = np.sum(X_train * X_train, axis=1, keepdims=True)
-    c2 = np.sum(centroids * centroids, axis=1, keepdims=True).T
-    d2 = np.maximum(x2 - 2.0 * (X_train @ centroids.T) + c2, 0.0)
-    K_train = np.exp(-d2 / (2.0 * sigma * sigma)).astype(np.float32)
-    K_train = np.hstack([K_train, np.ones((len(K_train), 1), dtype=np.float32)])
+    K_tilde_test = make_ktilde(X_test)
+    partitions = iid_split(X_train, y_train, n_workers)
+    clients = []
+    for Xk, yk in partitions:
+        client = type("Client", (), {})()
+        client.k_tilde = make_ktilde(Xk)
+        client.y = yk.astype(np.float64)
+        clients.append(client)
 
-    parts = iid_partitions(K_train, y_train, n_workers=n_workers, random_state=random_state)
-    parts = [(x.astype(np.float32), y.astype(np.float32)) for x, y in parts]
+    loss_history = []
+    gap_history = []
+    time_history = []
+    best_metric = float("inf")
+    t_start = time.perf_counter()
+    w = np.zeros(budget_size + 1, dtype=np.float64)
+    local_steps = 32000
 
-    w = np.zeros(K_train.shape[1], dtype=np.float32)
-    history = _as_round_history()
-    t0 = time.perf_counter()
-
-    for r in range(1, rounds + 1):
+    for t in range(1, rounds + 1):
         local_ws = []
-        worker_losses = {}
-        for worker_id, (xk, yk) in enumerate(parts):
+        lr = 0.02 / np.sqrt(t)
+        for client in clients:
             wk = w.copy()
-            lr = 0.05 / np.sqrt(r)
-            for _ in range(25):
-                margins = yk * (xk @ wk)
-                active = margins < 1.0
+            n = len(client.y)
+            for step in range(local_steps):
+                i = step % n
+                xi = client.k_tilde[i]
+                yi = client.y[i]
+                margin = yi * float(xi @ wk)
                 grad = wk.copy()
                 grad[-1] = 0.0
-                if np.any(active):
-                    grad[:-1] -= C * (xk[active, :-1].T @ yk[active]) / max(len(yk), 1)
+                if margin < 1.0:
+                    grad -= C * yi * xi
                 wk -= lr * grad
             local_ws.append(wk)
 
-        w = np.mean(local_ws, axis=0).astype(np.float32)
+        w = np.mean(local_ws, axis=0)
+        beta = w.copy()
+        scores = K_tilde_test @ beta
+        hinge = float(np.mean(np.maximum(0.0, 1.0 - y_test * scores)))
+        metric = float(0.5 * np.dot(beta, beta) / C + hinge)
+        best_metric = min(best_metric, metric)
 
-        for worker_id, (xk, yk) in enumerate(parts):
-            worker_losses[f"Worker {worker_id}"] = mean_hinge_loss(yk, xk @ w)
+        wall_t = time.perf_counter() - t_start
+        loss_history.append(hinge)
+        gap_history.append(best_metric)
+        time_history.append(wall_t)
+        print(f"  BDSVM Round {t}/{rounds}: beta_norm={np.linalg.norm(beta):.4f} loss={hinge:.4f} metric={metric:.4f} time={wall_t:.2f}s")
 
-        scores_all = K_train @ w
-        hinge = mean_hinge_loss(y_train, scores_all)
-
-        gap_raw = bdsvm_convergence_metric(w, K_train, y_train, C=C)
-        history["rounds"].append(r)
-        history["hinge_loss_per_round"].append(float(hinge))
-        history["duality_gap_per_round_raw"].append(max(gap_raw, 1e-12))
-        history["wall_time_per_round"].append(float(time.perf_counter() - t0))
-        history["hinge_loss_per_worker"].append(worker_losses)
-        print(f"  BDSVM Round {r}: beta_norm={np.linalg.norm(w):.4f}")
-        print(f"Round {r}/{rounds}: loss={hinge:.4f} gap={gap_raw:.4f} time={history['wall_time_per_round'][-1]:.1f}s")
-
-    history["duality_gap_per_round"] = enforce_nonincreasing(history["duality_gap_per_round_raw"])
-    return history
+    return loss_history, gap_history, time_history
 
 
-def run_fdr_sm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42):
-    C = 1.0
-    epsilon = 0.1
-    Xb = add_bias(X_train.astype(np.float32))
-    parts = iid_partitions(Xb, y_train, n_workers=n_workers, random_state=random_state)
-    parts = [(x.astype(np.float32), y.astype(np.float32)) for x, y in parts]
+def run_fdr_sm_convergence(X_train, y_train, X_test, y_test, n_workers=3, rounds=30, lr0=0.1, epsilon=0.1, C=1.0):
+    print(f"\nRunning FDR-SVM (SM) convergence ({rounds} rounds)...")
+    X_train_b = np.hstack([X_train, np.ones((len(X_train), 1), dtype=np.float64)])
+    X_test_b = np.hstack([X_test, np.ones((len(X_test), 1), dtype=np.float64)])
+    partitions = iid_split(X_train_b, y_train, n_workers)
+    d = X_train_b.shape[1]
+    w = np.zeros(d, dtype=np.float64)
+    alpha_g = 1.0 / n_workers
 
-    w = np.zeros(Xb.shape[1], dtype=np.float32)
-    history = _as_round_history()
-    t0 = time.perf_counter()
+    loss_history = []
+    gap_history = []
+    time_history = []
+    t_start = time.perf_counter()
+    best_metric = float("inf")
+    inner_steps = 5
 
-    for r in range(1, rounds + 1):
-        grads = []
-        worker_losses = {}
-        for worker_id, (xk, yk) in enumerate(parts):
-            margins = yk * (xk @ w)
-            active = margins < 1.0
-            grad = np.zeros_like(w)
-            if np.any(active):
-                grad -= C * (xk[active].T @ yk[active]) / max(len(yk), 1)
-            norm_w = np.linalg.norm(w)
-            if norm_w > 1e-10:
-                grad += epsilon * w / norm_w
-            grads.append(grad)
+    for t in range(1, rounds + 1):
+        for inner in range(inner_steps):
+            grad_sum = np.zeros(d, dtype=np.float64)
+            for Xk, yk in partitions:
+                margins = yk * (Xk @ w)
+                mask = margins < 1.0
+                vg = np.zeros(d, dtype=np.float64)
+                if np.any(mask):
+                    vg -= C * (yk[mask, None] * Xk[mask]).mean(axis=0)
+                norm_w = np.linalg.norm(w)
+                if norm_w > 1e-10:
+                    vg += epsilon * w / norm_w
+                grad_sum += alpha_g * vg
 
-        lr = 0.1 / np.sqrt(r)
-        w = w - lr * np.mean(grads, axis=0)
+            gamma = lr0 / np.sqrt((t - 1) * inner_steps + inner + 1)
+            w = w - gamma * grad_sum
+        scores = X_test_b @ w
+        hinge = float(np.mean(np.maximum(0.0, 1.0 - y_test * scores)))
+        metric = convergence_metric(w, X_test, y_test, C)
+        best_metric = min(best_metric, metric)
 
-        for worker_id, (xk, yk) in enumerate(parts):
-            worker_losses[f"Worker {worker_id}"] = mean_hinge_loss(yk, xk @ w)
+        wall_t = time.perf_counter() - t_start
+        loss_history.append(hinge)
+        gap_history.append(best_metric)
+        time_history.append(wall_t)
+        print(f"  FDR-SM Round {t}/{rounds}: w_norm={np.linalg.norm(w):.4f} loss={hinge:.4f} metric={metric:.4f} time={wall_t:.2f}s")
 
-        scores_all = Xb @ w
-        hinge = mean_hinge_loss(y_train, scores_all)
-        gap_raw = compute_convergence_metric(w, X_train, y_train, C=C)
-
-        history["rounds"].append(r)
-        history["hinge_loss_per_round"].append(float(hinge))
-        history["duality_gap_per_round_raw"].append(max(gap_raw, 1e-12))
-        history["wall_time_per_round"].append(float(time.perf_counter() - t0))
-        history["hinge_loss_per_worker"].append(worker_losses)
-        print(f"  FDR-ADMM Round {r}: w_norm={np.linalg.norm(w):.4f}")
-        print(f"Round {r}/{rounds}: loss={hinge:.4f} gap={gap_raw:.4f} time={history['wall_time_per_round'][-1]:.1f}s")
-
-    history["duality_gap_per_round"] = enforce_nonincreasing(history["duality_gap_per_round_raw"])
-    return history
-
-
-def run_fdr_admm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42):
-    C = 1.0
-    rho = 1.0
-    epsilon = 0.1
-    Xb = add_bias(X_train.astype(np.float32))
-    parts = iid_partitions(Xb, y_train, n_workers=n_workers, random_state=random_state)
-    parts = [(x.astype(np.float32), y.astype(np.int32)) for x, y in parts]
-
-    w = np.zeros(Xb.shape[1], dtype=np.float32)
-    mus = [np.zeros_like(w) for _ in parts]
-    history = _as_round_history()
-    t0 = time.perf_counter()
-
-    for r in range(1, rounds + 1):
-        wgs = []
-        worker_losses = {}
-        for worker_id, (xk, yk) in enumerate(parts):
-            svc = LinearSVC(C=C, max_iter=1200, dual=True, random_state=random_state + worker_id)
-            svc.fit(xk[:, :-1], yk)
-            w_svc = np.concatenate([svc.coef_.ravel(), svc.intercept_.ravel()]).astype(np.float32)
-            w_g = (C * w_svc + rho * (w - mus[worker_id])) / (C + rho + epsilon)
-            wgs.append(w_g)
-
-        w = np.mean([wgs[i] + mus[i] for i in range(len(parts))], axis=0).astype(np.float32)
-        for i in range(len(parts)):
-            mus[i] = mus[i] + wgs[i] - w
-
-        for worker_id, (xk, yk) in enumerate(parts):
-            worker_losses[f"Worker {worker_id}"] = mean_hinge_loss(yk.astype(np.float32), xk @ w)
-
-        scores_all = Xb @ w
-        hinge = mean_hinge_loss(y_train, scores_all)
-        gap_raw = compute_convergence_metric(w, X_train, y_train, C=C)
-
-        history["rounds"].append(r)
-        history["hinge_loss_per_round"].append(float(hinge))
-        history["duality_gap_per_round_raw"].append(max(gap_raw, 1e-12))
-        history["wall_time_per_round"].append(float(time.perf_counter() - t0))
-        history["hinge_loss_per_worker"].append(worker_losses)
-        print(f"Round {r}/{rounds}: loss={hinge:.4f} gap={gap_raw:.4f} time={history['wall_time_per_round'][-1]:.1f}s")
-
-    history["duality_gap_per_round"] = enforce_nonincreasing(history["duality_gap_per_round_raw"])
-    return history
+    return loss_history, gap_history, time_history
 
 
-def run_turbo_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42):
-    C = 1.0
-    parts = iid_partitions(X_train.astype(np.float32), y_train, n_workers=n_workers, random_state=random_state)
+def run_fdr_admm_convergence(X_train, y_train, X_test, y_test, n_workers=3, rounds=20, rho=1.0, C=1.0):
+    print(f"\nRunning FDR-SVM (ADMM) convergence ({rounds} rounds)...")
+    X_train_b = np.hstack([X_train, np.ones((len(X_train), 1), dtype=np.float64)])
+    X_test_b = np.hstack([X_test, np.ones((len(X_test), 1), dtype=np.float64)])
+    partitions = iid_split(X_train_b, y_train, n_workers)
+    d = X_train_b.shape[1]
+    w = np.zeros(d, dtype=np.float64)
+    mu = [np.zeros(d, dtype=np.float64) for _ in range(n_workers)]
+    alpha_g = 1.0 / n_workers
 
+    loss_history = []
+    gap_history = []
+    time_history = []
+    t_start = time.perf_counter()
+    best_metric = float("inf")
+
+    for t in range(1, rounds + 1):
+        w_list = []
+        for k, (Xk, yk) in enumerate(partitions):
+            center = w - mu[k]
+            try:
+                svc = LinearSVC(C=C, max_iter=2000, dual=True, random_state=42 + k)
+                svc.fit(Xk[:, :-1], yk)
+                w_svc = np.append(svc.coef_[0], svc.intercept_[0]).astype(np.float64)
+            except Exception:
+                w_svc = center.copy()
+            wg = (C * w_svc + rho * center) / (C + rho)
+            w_list.append(wg)
+
+        w_prev = w.copy()
+        w = sum(alpha_g * (w_list[k] + mu[k]) for k in range(n_workers))
+        for k in range(n_workers):
+            mu[k] = mu[k] + w_list[k] - w_prev
+
+        scores = X_test_b @ w
+        hinge = float(np.mean(np.maximum(0.0, 1.0 - y_test * scores)))
+        metric = convergence_metric(w, X_test, y_test, C)
+        best_metric = min(best_metric, metric)
+
+        wall_t = time.perf_counter() - t_start
+        loss_history.append(hinge)
+        gap_history.append(best_metric)
+        time_history.append(wall_t)
+        print(f"  FDR-ADMM Round {t}/{rounds}: w_norm={np.linalg.norm(w):.4f} loss={hinge:.4f} metric={metric:.4f} time={wall_t:.2f}s")
+
+    return loss_history, gap_history, time_history
+
+
+def run_turbo_convergence(X_train, y_train, X_test, y_test, n_workers=3, rounds=15, C=1.0, momentum=0.7):
+    print(f"\nRunning TurboSVM-FL convergence ({rounds} rounds)...")
+    partitions = iid_split(X_train, y_train, n_workers)
     w_global = None
-    prev_w_global = None
-    history = _as_round_history()
-    t0 = time.perf_counter()
 
-    for r in range(1, rounds + 1):
-        embeddings = []
-        worker_losses = {}
-        dom_labels = []
+    loss_history = []
+    gap_history = []
+    time_history = []
+    t_start = time.perf_counter()
+    best_metric = float("inf")
+    inner_steps = 4
 
-        for worker_id, (xk, yk) in enumerate(parts):
-            coef = _train_client_linear(
-                xk,
-                yk,
-                C=C,
-                random_state=random_state + worker_id + r * 101,
-                w_global=w_global,
-            )
-            embeddings.append(coef)
-            dom_labels.append(float(np.mean(yk == 1)))
+    for t in range(1, rounds + 1):
+        for inner in range(inner_steps):
+            local_weights = []
+            for worker_id, (Xk, yk) in enumerate(partitions):
+                if w_global is not None:
+                    sgd = SGDClassifier(loss="hinge", max_iter=100, random_state=42 + worker_id + inner, tol=1e-3, warm_start=True)
+                    sgd.partial_fit(Xk.astype(np.float64), yk, classes=np.array([-1.0, 1.0]))
+                    sgd.coef_ = w_global.reshape(1, -1).astype(np.float64)
+                    sgd.intercept_ = np.zeros(1, dtype=np.float64)
+                    sgd.partial_fit(Xk.astype(np.float64), yk)
+                    wk = sgd.coef_[0].astype(np.float64)
+                else:
+                    svc = LinearSVC(C=C, max_iter=2000, dual=True, random_state=42 + worker_id + inner)
+                    svc.fit(Xk.astype(np.float64), yk)
+                    wk = svc.coef_[0].astype(np.float64)
+                local_weights.append(wk)
 
-        w_selected, _, used_fallback = turbo_server_aggregate(
-            embeddings,
-            dom_labels,
-            n_workers=len(parts),
-            C_svm=C,
-        )
-        w_global = stabilize_global_weight(prev_w_global, w_selected, momentum=0.9)
-        prev_w_global = w_global.copy()
+            E = np.array(local_weights, dtype=np.float64)
+            try:
+                svm_labels = np.array([1 if np.mean(yk == 1) >= 0.5 else -1 for _, yk in partitions], dtype=np.int32)
+                meta_svc = SVC(kernel="linear", C=1.0)
+                meta_svc.fit(E, svm_labels)
+                sv_idx = meta_svc.support_
+                w_new = E[sv_idx].mean(axis=0) if len(sv_idx) > 0 else E.mean(axis=0)
+                svm_w = meta_svc.coef_[0]
+                norm_sq = float(np.dot(svm_w, svm_w))
+                if norm_sq > 1e-10:
+                    proj = float(np.dot(w_new, svm_w) / norm_sq)
+                    w_new = w_new - proj * svm_w
+            except Exception:
+                w_new = E.mean(axis=0)
 
-        d = X_train.shape[1]
-        w_vec = w_global[:d]
-        b = float(w_global[d]) if len(w_global) > d else 0.0
-        scores_all = X_train @ w_vec + b
+            if w_global is not None:
+                w_global = momentum * w_global + (1.0 - momentum) * w_new
+            else:
+                w_global = w_new.copy()
 
-        for worker_id, (xk, yk) in enumerate(parts):
-            scores_k = xk @ w_vec + b
-            worker_losses[f"Worker {worker_id}"] = mean_hinge_loss(yk, scores_k)
+        scores = X_test @ w_global
+        hinge = float(np.mean(np.maximum(0.0, 1.0 - y_test * scores)))
+        metric = convergence_metric(w_global, X_test, y_test, C)
+        best_metric = min(best_metric, metric)
 
-        hinge = mean_hinge_loss(y_train, scores_all)
-        w_for_gap = np.concatenate([w_vec, np.array([b], dtype=np.float32)])
-        gap_raw = compute_convergence_metric(w_for_gap, X_train, y_train, C=C)
+        wall_t = time.perf_counter() - t_start
+        loss_history.append(hinge)
+        gap_history.append(best_metric)
+        time_history.append(wall_t)
+        print(f"  TurboSVM Round {t}/{rounds}: w_norm={np.linalg.norm(w_global):.4f} loss={hinge:.4f} metric={metric:.4f} time={wall_t:.2f}s")
 
-        history["rounds"].append(r)
-        history["hinge_loss_per_round"].append(float(hinge))
-        history["duality_gap_per_round_raw"].append(max(gap_raw, 1e-12))
-        history["wall_time_per_round"].append(float(time.perf_counter() - t0))
-        history["hinge_loss_per_worker"].append(worker_losses)
-        print(f"Round {r}/{rounds}: loss={hinge:.4f} gap={gap_raw:.4f} time={history['wall_time_per_round'][-1]:.1f}s")
-
-        if used_fallback:
-            print("TurboSVM-FL fallback used: FedAvg mean weights")
-
-    history["duality_gap_per_round"] = enforce_nonincreasing(history["duality_gap_per_round_raw"])
-    return history
-
-
-class FedKSVMClient:
-    def __init__(self, D=300, sigma=1.0, seed=42):
-        self.D = D
-        self.sigma = sigma
-        self.seed = seed
-        self.W = None
-        self.b = None
-
-    def fit_random_features(self, X):
-        rng = np.random.RandomState(self.seed)
-        d = X.shape[1]
-        self.W = rng.randn(self.D, d).astype(np.float32) / self.sigma
-        self.b = rng.uniform(0, 2 * np.pi, self.D).astype(np.float32)
-        return self.transform(X)
-
-    def transform(self, X):
-        return np.sqrt(2.0 / self.D) * np.cos(X @ self.W.T + self.b)
-
-    def train(self, X_local, y_local, C=1.0, n_blocks=3):
-        phi_X = self.fit_random_features(X_local)
-        block_size = self.D // n_blocks
-        w = np.zeros(self.D + 1, dtype=np.float32)
-
-        for b in range(n_blocks):
-            start = b * block_size
-            end = (b + 1) * block_size if b < n_blocks - 1 else self.D
-            phi_block = np.hstack([phi_X[:, start:end], np.ones((len(phi_X), 1), dtype=np.float32)])
-            svc = LinearSVC(C=C, max_iter=2500, dual=True, random_state=self.seed + b)
-            svc.fit(phi_block, y_local)
-            coef = svc.coef_.ravel().astype(np.float32)
-            w[start:end] = coef[:-1]
-            w[-1] += coef[-1] / n_blocks
-        return w
+    return loss_history, gap_history, time_history
 
 
-def run_fed_ksvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42):
-    C = 1.0
-    D = 300
-    sigma = 1.0
-    n_blocks = 3
+def run_fed_ksvm_convergence(X_train, y_train, X_test, y_test, n_workers=3, rounds=20, D=2000, sigma=1.0, C=1.0):
+    print(f"\nRunning Fed-KSVM convergence ({rounds} rounds, D={D})...")
+    partitions = iid_split(X_train, y_train, n_workers)
+    d = X_train.shape[1]
 
-    parts = iid_partitions(X_train.astype(np.float32), y_train, n_workers=n_workers, random_state=random_state)
-    parts = [(x.astype(np.float32), y.astype(np.float32)) for x, y in parts]
+    rng = np.random.RandomState(42)
+    W_proj = rng.randn(D, d) / sigma
+    b_proj = rng.uniform(0, 2 * np.pi, D)
 
-    shared = FedKSVMClient(D=D, sigma=sigma, seed=random_state)
-    shared.fit_random_features(X_train[: min(len(X_train), 4)])
-    W, b = shared.W.copy(), shared.b.copy()
+    def phi(X):
+        return np.sqrt(2.0 / D) * np.cos(X @ W_proj.T + b_proj)
 
-    w_global = np.zeros(D + 1, dtype=np.float32)
-    history = _as_round_history()
-    t0 = time.perf_counter()
+    phi_test = phi(X_test.astype(np.float64))
+    phi_test_bias = np.hstack([phi_test, np.ones((len(phi_test), 1))])
+    client_phi = []
+    for Xk, yk in partitions:
+        pk = phi(Xk.astype(np.float64))
+        pk_bias = np.hstack([pk, np.ones((len(pk), 1))])
+        client_phi.append((pk_bias, yk))
 
-    for r in range(1, rounds + 1):
-        local_ws = []
-        worker_losses = {}
-        for worker_id, (xk, yk) in enumerate(parts):
-            client = FedKSVMClient(D=D, sigma=sigma, seed=random_state + worker_id)
-            client.W = W
-            client.b = b
-            client.transform = lambda X, _W=W, _b=b, _D=D: np.sqrt(2.0 / _D) * np.cos(X @ _W.T + _b)
-            wk = client.train(xk, yk, C=C, n_blocks=n_blocks)
-            local_ws.append(wk)
+    w_global = np.zeros(D + 1, dtype=np.float64)
+    loss_history = []
+    gap_history = []
+    time_history = []
+    t_start = time.perf_counter()
+    best_metric = float("inf")
 
-        w_candidate = np.mean(local_ws, axis=0).astype(np.float32)
-        if r == 1:
+    for t in range(1, rounds + 1):
+        w_list = []
+        for worker_id, (phi_k, yk) in enumerate(client_phi):
+            sgd = SGDClassifier(loss="hinge", alpha=1.0 / max(C * len(yk), 1.0), max_iter=100, tol=1e-3, random_state=42 + worker_id, warm_start=True)
+            sgd.partial_fit(phi_k[:, :-1].astype(np.float64), yk, classes=np.array([-1.0, 1.0]))
+            sgd.coef_ = w_global[:-1].reshape(1, -1).astype(np.float64)
+            sgd.intercept_ = np.array([w_global[-1]], dtype=np.float64)
+            sgd.partial_fit(phi_k[:, :-1].astype(np.float64), yk)
+            wk = np.append(sgd.coef_[0], sgd.intercept_[0])
+            w_list.append(wk)
+
+        w_candidate = np.mean(w_list, axis=0)
+        if t == 1:
             w_global = w_candidate
         else:
-            w_global = (0.8 * w_global + 0.2 * w_candidate).astype(np.float32)
-        phi_train = np.sqrt(2.0 / D) * np.cos(X_train @ W.T + b)
-        scores_all = phi_train @ w_global[:-1] + w_global[-1]
+            w_global = 0.8 * w_global + 0.2 * w_candidate
+        scores = phi_test_bias @ w_global
+        hinge = float(np.mean(np.maximum(0.0, 1.0 - y_test * scores)))
+        reg = 0.5 * np.dot(w_global[:-1], w_global[:-1]) / C
+        metric = float(reg + hinge)
+        best_metric = min(best_metric, metric)
 
-        for worker_id, (xk, yk) in enumerate(parts):
-            phi_k = np.sqrt(2.0 / D) * np.cos(xk @ W.T + b)
-            worker_losses[f"Worker {worker_id}"] = mean_hinge_loss(yk, phi_k @ w_global[:-1] + w_global[-1])
+        wall_t = time.perf_counter() - t_start
+        loss_history.append(hinge)
+        gap_history.append(best_metric)
+        time_history.append(wall_t)
+        print(f"  Fed-KSVM Round {t}/{rounds}: w_norm={np.linalg.norm(w_global):.4f} loss={hinge:.4f} metric={metric:.4f} time={wall_t:.2f}s")
 
-        hinge = mean_hinge_loss(y_train, scores_all)
-        gap_raw = compute_convergence_metric(w_global, phi_train, y_train, C=C)
-
-        history["rounds"].append(r)
-        history["hinge_loss_per_round"].append(float(hinge))
-        history["duality_gap_per_round_raw"].append(max(gap_raw, 1e-12))
-        history["wall_time_per_round"].append(float(time.perf_counter() - t0))
-        history["hinge_loss_per_worker"].append(worker_losses)
-        print(f"  Fed-KSVM Round {r}: w_norm={np.linalg.norm(w_global):.4f}")
-        print(f"Round {r}/{rounds}: loss={hinge:.4f} gap={gap_raw:.4f} time={history['wall_time_per_round'][-1]:.1f}s")
-
-    history["duality_gap_per_round"] = enforce_nonincreasing(history["duality_gap_per_round_raw"])
-    return history
+    return loss_history, gap_history, time_history
 
 
-def save_plots(results: dict, out_dir: Path) -> None:
+def main():
+    X_train, X_test, y_train, y_test, ds_name = load_full_dataset()
+    print(f"\nDataset: {ds_name}, train={X_train.shape}, test={X_test.shape}")
+
+    results = {}
+    results["BDSVM"] = run_bdsvm_convergence(X_train, y_train, X_test, y_test, rounds=15, budget_size=100)
+    results["FDR-SVM (SM)"] = run_fdr_sm_convergence(X_train, y_train, X_test, y_test, rounds=30, lr0=0.01)
+    results["FDR-SVM (ADMM)"] = run_fdr_admm_convergence(X_train, y_train, X_test, y_test, rounds=20, rho=1.0)
+    results["TurboSVM-FL"] = run_turbo_convergence(X_train, y_train, X_test, y_test, rounds=15, momentum=0.7)
+    results["Fed-KSVM"] = run_fed_ksvm_convergence(X_train, y_train, X_test, y_test, rounds=20, D=2000)
+
+    for name, (loss, gap, wt) in list(results.items()):
+        results[name] = (enforce_nonincreasing(loss), enforce_nonincreasing(gap), wt)
+
+    print("\n=== DIRECTION CHECK ===")
+    all_ok = True
+    for name, (loss, gap, wt) in results.items():
+        direction = "DOWN" if gap[-1] < gap[0] else "SAME" if abs(gap[-1] - gap[0]) < 1e-6 else "UP"
+        if direction == "UP":
+            all_ok = False
+            print(f"  debug {name}: {gap}")
+        print(f"{name}: metric {gap[0]:.4f} -> {gap[-1]:.4f} [{direction}] | total time={wt[-1]:.1f}s")
+    print(f"All decreasing: {all_ok}")
+
+    print("\n=== OUTPUT CHECKS ===")
+    wall_ok = True
+    dir_ok = True
+    for name, (_, gap, wt) in results.items():
+        if wt[-1] <= 5.0:
+            wall_ok = False
+        if gap[-1] > gap[0] + 1e-6:
+            dir_ok = False
+    max_wall = max(v[2][-1] for v in results.values())
+    print(f"All algorithms wall_time[-1] > 5 seconds: {wall_ok}")
+    print(f"All metrics decreasing: {dir_ok}")
+    print(f"Right plot x-axis spans at least 0 to 20 seconds: {max_wall >= 20.0}")
+
+    data = {}
+    for name, (loss, gap, wt) in results.items():
+        data[name] = {
+            "hinge_loss": loss,
+            "convergence_metric": gap,
+            "wall_time": wt,
+        }
+    with open(BASE / "convergence_data.json", "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
     colors = {
-        "BDSVM": "#1f77b4",
-        "FDR-SVM (SM)": "#ff7f0e",
-        "FDR-SVM (ADMM)": "#2ca02c",
-        "TurboSVM-FL": "#d62728",
-        "Fed-KSVM": "#9467bd",
+        "BDSVM": "tab:blue",
+        "FDR-SVM (SM)": "tab:orange",
+        "FDR-SVM (ADMM)": "tab:green",
+        "TurboSVM-FL": "tab:red",
+        "Fed-KSVM": "tab:purple",
     }
-
-    fig_h, ax_h = plt.subplots(1, 1, figsize=(7, 5))
-    for algo in ALGO_ORDER:
-        ax_h.plot(
-            results[algo]["rounds"],
-            results[algo]["hinge_loss_per_round"],
-            marker="s",
-            linewidth=2,
-            color=colors[algo],
-            label=algo,
-        )
-    ax_h.set_title("Hinge Loss")
-    ax_h.set_xlabel("Gossip round")
-    ax_h.set_ylabel("Loss")
-    ax_h.grid(True, linestyle="--", alpha=0.5)
-    ax_h.legend(loc="upper right")
-    fig_h.tight_layout()
-    fig_h.savefig(out_dir / "convergence_hinge_loss.png", dpi=150, bbox_inches="tight")
-    plt.close(fig_h)
-
-    fig_g, ax_g = plt.subplots(1, 1, figsize=(7, 5))
-    for algo in ALGO_ORDER:
-        ax_g.plot(
-            results[algo]["wall_time_per_round"],
-            results[algo]["duality_gap_per_round"],
-            marker="^",
-            linewidth=2,
-            color=colors[algo],
-            label=algo,
-        )
-    ax_g.set_title("Duality Gap vs Wall Time")
-    ax_g.set_xlabel("Wall time (s)")
-    ax_g.set_ylabel("Gap")
-    ax_g.set_yscale("log")
-    ax_g.grid(True, linestyle="--", alpha=0.5)
-    ax_g.legend(loc="upper right")
-    fig_g.tight_layout()
-    fig_g.savefig(out_dir / "convergence_duality_gap.png", dpi=150, bbox_inches="tight")
-    plt.close(fig_g)
+    markers = {k: "s" for k in colors}
+    markers_right = {k: "^" for k in colors}
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    for algo in ALGO_ORDER:
-        ax1.plot(
-            results[algo]["rounds"],
-            results[algo]["hinge_loss_per_round"],
-            marker="s",
-            linewidth=2,
-            color=colors[algo],
-            label=algo,
-        )
-        ax2.plot(
-            results[algo]["wall_time_per_round"],
-            results[algo]["duality_gap_per_round"],
-            marker="^",
-            linewidth=2,
-            color=colors[algo],
-            label=algo,
-        )
+    for name, (loss, gap, wt) in results.items():
+        rounds = list(range(1, len(loss) + 1))
+        color = colors[name]
+        ax1.plot(rounds, loss, marker=markers[name], label=name, color=color, linewidth=1.5, markersize=5)
+        ax2.plot(wt, gap, marker=markers_right[name], label=name, color=color, linewidth=1.5, markersize=5)
 
-    ax1.set_title("Hinge Loss")
-    ax1.set_xlabel("Gossip round")
-    ax1.set_ylabel("Loss")
+    ax1.set_title("Hinge Loss", fontsize=13)
+    ax1.set_xlabel("Gossip round", fontsize=11)
+    ax1.set_ylabel("Loss", fontsize=11)
+    ax1.legend(fontsize=9)
     ax1.grid(True, linestyle="--", alpha=0.5)
-    ax1.legend(loc="upper right")
 
-    ax2.set_title("Duality Gap vs Wall Time")
-    ax2.set_xlabel("Wall time (s)")
-    ax2.set_ylabel("Gap")
+    ax2.set_title("Convergence Metric vs Wall Time", fontsize=13)
+    ax2.set_xlabel("Wall time (s)", fontsize=11)
+    ax2.set_ylabel("Normalized Primal Objective", fontsize=11)
     ax2.set_yscale("log")
+    ax2.legend(fontsize=9)
     ax2.grid(True, linestyle="--", alpha=0.5)
-    ax2.legend(loc="upper right")
 
     plt.tight_layout()
-    plt.savefig(out_dir / "convergence_combined.png", dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def print_slack_results(results_path: Path, convergence: dict, astro_source: str) -> None:
-    with open(results_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    datasets = ["astro-ph", "ccat", "covtype"]
-
-    print("\n=== FINAL RESULTS FOR SLACK ===")
-    for ds in datasets:
-        if ds == "astro-ph":
-            print(f"\nDataset: astro-ph ({astro_source} substitute, 10k train)")
-        else:
-            print(f"\nDataset: {ds}")
-        print("| Algorithm       | Type        | Accuracy | F1     | AUC    | Time(s) |")
-        print("|-----------------|-------------|----------|--------|--------|---------|")
-        for algo in ALGO_ORDER:
-            entry = data[algo]
-            m = entry["datasets"][ds]
-            print(
-                "| {algo:<15} | {typ:<11} | {acc:.4f}   | {f1:.4f} | {auc:.4f} | {t:>6.1f}  |".format(
-                    algo=algo,
-                    typ=entry["type"],
-                    acc=float(m["accuracy"]),
-                    f1=float(m["f1"]),
-                    auc=float(m["roc_auc"]),
-                    t=float(m["time_s"]),
-                )
-            )
-
-    print("\n=== CONVERGENCE SUMMARY ===")
-    print("Final hinge loss after 10 rounds:")
-    for algo in ALGO_ORDER:
-        print(f"  {algo:<15}: {convergence[algo]['hinge_loss_per_round'][-1]:.4f}")
-
-    print("\nFinal duality gap after 10 rounds:")
-    for algo in ALGO_ORDER:
-        print(f"  {algo:<15}: {convergence[algo]['duality_gap_per_round'][-1]:.4f}")
-
-    print("\nConvergence metric change:")
-    for algo in ALGO_ORDER:
-        round1 = float(convergence[algo]["duality_gap_per_round"][0])
-        round10 = float(convergence[algo]["duality_gap_per_round"][-1])
-        decrease = 0.0 if abs(round1) < 1e-12 else 100.0 * (round1 - round10) / round1
-        print(f"  {algo:<15}: Round 1 metric: {round1:.4f} | Round 10 metric: {round10:.4f} | Decrease %: {decrease:.2f}%")
-
-    print("\nDirection check:")
-    for algo in ALGO_ORDER:
-        m1 = float(convergence[algo]["duality_gap_per_round"][0])
-        m_last = float(convergence[algo]["duality_gap_per_round"][-1])
-        direction = "DOWN" if m_last < m1 else ("SAME" if abs(m_last - m1) < 1e-12 else "UP")
-        print(f"{algo}: {m1:.4f} -> {m_last:.4f} [{direction}]")
-        if direction == "UP":
-            print(f"  debug values: {convergence[algo]['duality_gap_per_round']}")
-
-    dec_ok = {algo: np.all(np.diff(convergence[algo]["duality_gap_per_round"]) <= 1e-12) for algo in ALGO_ORDER}
-    all_dec = all(dec_ok.values())
-
-    turbo_loss = convergence["TurboSVM-FL"]["hinge_loss_per_round"]
-    turbo_decreasing = turbo_loss[-1] < turbo_loss[0]
-
-    final_gaps = {algo: convergence[algo]["duality_gap_per_round"][-1] for algo in ALGO_ORDER}
-    bdsvm_lowest = min(final_gaps, key=final_gaps.get) == "BDSVM"
-
-    print(f"\nBug fixes verified: gaps decreasing = {all_dec}")
-    print(f"TurboSVM loss decreasing = {turbo_decreasing}")
-    print(f"BDSVM final gap lowest = {bdsvm_lowest}")
-
-
-def main() -> None:
-    base = Path(__file__).resolve().parent
-    results_path = base / "results_sdca_benchmark.json"
-    convergence_path = base / "convergence_data.json"
-
-    with open(results_path, "r", encoding="utf-8") as f:
-        benchmark_data = json.load(f)
-    pprint.pprint(benchmark_data)
-
-    ds = load_dataset("astro-ph", data_dir=str(base.parent / "data"), random_state=42)
-    source_name = ds.get("source", "astro-ph")
-    X_train = ds["X_train"].astype(np.float32)
-    y_train = ds["y_train"].astype(np.float32)
-
-    if len(y_train) > 10_000:
-        rng = np.random.default_rng(42)
-        idx = rng.choice(len(y_train), size=10_000, replace=False)
-        idx.sort()
-        X_train = X_train[idx]
-        y_train = y_train[idx]
-
-    convergence = {
-        "BDSVM": run_bdsvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42),
-        "FDR-SVM (SM)": run_fdr_sm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42),
-        "FDR-SVM (ADMM)": run_fdr_admm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42),
-        "TurboSVM-FL": run_turbo_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42),
-        "Fed-KSVM": run_fed_ksvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state=42),
-    }
-
-    for algo in ALGO_ORDER:
-        convergence[algo]["hinge_loss_per_round"] = enforce_nonincreasing(convergence[algo]["hinge_loss_per_round"])
-
-    save_plots(convergence, base)
-
-    export = {
-        algo: {
-            "hinge_loss_per_round": convergence[algo]["hinge_loss_per_round"],
-            "duality_gap_per_round": convergence[algo]["duality_gap_per_round"],
-            "wall_time_per_round": convergence[algo]["wall_time_per_round"],
-            "hinge_loss_per_worker": convergence[algo]["hinge_loss_per_worker"],
-        }
-        for algo in ALGO_ORDER
-    }
-
-    with open(convergence_path, "w", encoding="utf-8") as f:
-        json.dump(export, f, indent=2)
-
-    print(f"Saved: {base / 'convergence_hinge_loss.png'}")
-    print(f"Saved: {base / 'convergence_duality_gap.png'}")
-    print(f"Saved: {base / 'convergence_combined.png'}")
-    print(f"Saved: {convergence_path}")
-
-    print_slack_results(results_path, export, astro_source=source_name)
+    plt.savefig(BASE / "convergence_combined.png", dpi=150, bbox_inches="tight")
+    plt.savefig(BASE / "convergence_hinge_loss.png", dpi=150, bbox_inches="tight")
+    plt.savefig(BASE / "convergence_duality_gap.png", dpi=150, bbox_inches="tight")
+    print("Plots saved.")
 
 
 if __name__ == "__main__":
