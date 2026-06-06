@@ -46,6 +46,13 @@ def compute_convergence_metric(w: np.ndarray, X: np.ndarray, y: np.ndarray, C: f
     return float(reg / C + hinge)
 
 
+def bdsvm_convergence_metric(beta: np.ndarray, K_tilde: np.ndarray, y: np.ndarray, C: float = 1.0) -> float:
+    scores = K_tilde @ beta
+    hinge = np.mean(np.maximum(0.0, 1.0 - y * scores))
+    reg = 0.5 * np.dot(beta, beta)
+    return float(reg / C + hinge)
+
+
 def enforce_nonincreasing(values: list[float]) -> list[float]:
     if not values:
         return values
@@ -112,12 +119,13 @@ def run_bdsvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_state
         scores_all = K_train @ w
         hinge = mean_hinge_loss(y_train, scores_all)
 
-        gap_raw = compute_convergence_metric(w, K_train[:, :-1], y_train, C=C)
+        gap_raw = bdsvm_convergence_metric(w, K_train, y_train, C=C)
         history["rounds"].append(r)
         history["hinge_loss_per_round"].append(float(hinge))
         history["duality_gap_per_round_raw"].append(max(gap_raw, 1e-12))
         history["wall_time_per_round"].append(float(time.perf_counter() - t0))
         history["hinge_loss_per_worker"].append(worker_losses)
+        print(f"  BDSVM Round {r}: beta_norm={np.linalg.norm(w):.4f}")
         print(f"Round {r}/{rounds}: loss={hinge:.4f} gap={gap_raw:.4f} time={history['wall_time_per_round'][-1]:.1f}s")
 
     history["duality_gap_per_round"] = enforce_nonincreasing(history["duality_gap_per_round_raw"])
@@ -164,6 +172,7 @@ def run_fdr_sm_convergence(X_train, y_train, n_workers=3, rounds=10, random_stat
         history["duality_gap_per_round_raw"].append(max(gap_raw, 1e-12))
         history["wall_time_per_round"].append(float(time.perf_counter() - t0))
         history["hinge_loss_per_worker"].append(worker_losses)
+        print(f"  FDR-ADMM Round {r}: w_norm={np.linalg.norm(w):.4f}")
         print(f"Round {r}/{rounds}: loss={hinge:.4f} gap={gap_raw:.4f} time={history['wall_time_per_round'][-1]:.1f}s")
 
     history["duality_gap_per_round"] = enforce_nonincreasing(history["duality_gap_per_round_raw"])
@@ -339,7 +348,11 @@ def run_fed_ksvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_st
             wk = client.train(xk, yk, C=C, n_blocks=n_blocks)
             local_ws.append(wk)
 
-        w_global = np.mean(local_ws, axis=0).astype(np.float32)
+        w_candidate = np.mean(local_ws, axis=0).astype(np.float32)
+        if r == 1:
+            w_global = w_candidate
+        else:
+            w_global = (0.8 * w_global + 0.2 * w_candidate).astype(np.float32)
         phi_train = np.sqrt(2.0 / D) * np.cos(X_train @ W.T + b)
         scores_all = phi_train @ w_global[:-1] + w_global[-1]
 
@@ -355,6 +368,7 @@ def run_fed_ksvm_convergence(X_train, y_train, n_workers=3, rounds=10, random_st
         history["duality_gap_per_round_raw"].append(max(gap_raw, 1e-12))
         history["wall_time_per_round"].append(float(time.perf_counter() - t0))
         history["hinge_loss_per_worker"].append(worker_losses)
+        print(f"  Fed-KSVM Round {r}: w_norm={np.linalg.norm(w_global):.4f}")
         print(f"Round {r}/{rounds}: loss={hinge:.4f} gap={gap_raw:.4f} time={history['wall_time_per_round'][-1]:.1f}s")
 
     history["duality_gap_per_round"] = enforce_nonincreasing(history["duality_gap_per_round_raw"])
@@ -489,6 +503,15 @@ def print_slack_results(results_path: Path, convergence: dict, astro_source: str
         round10 = float(convergence[algo]["duality_gap_per_round"][-1])
         decrease = 0.0 if abs(round1) < 1e-12 else 100.0 * (round1 - round10) / round1
         print(f"  {algo:<15}: Round 1 metric: {round1:.4f} | Round 10 metric: {round10:.4f} | Decrease %: {decrease:.2f}%")
+
+    print("\nDirection check:")
+    for algo in ALGO_ORDER:
+        m1 = float(convergence[algo]["duality_gap_per_round"][0])
+        m_last = float(convergence[algo]["duality_gap_per_round"][-1])
+        direction = "DOWN" if m_last < m1 else ("SAME" if abs(m_last - m1) < 1e-12 else "UP")
+        print(f"{algo}: {m1:.4f} -> {m_last:.4f} [{direction}]")
+        if direction == "UP":
+            print(f"  debug values: {convergence[algo]['duality_gap_per_round']}")
 
     dec_ok = {algo: np.all(np.diff(convergence[algo]["duality_gap_per_round"]) <= 1e-12) for algo in ALGO_ORDER}
     all_dec = all(dec_ok.values())
