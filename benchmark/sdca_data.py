@@ -168,8 +168,6 @@ def load_astro_ph(data_dir: str = "data", random_state: int = 42) -> Dict[str, n
 def load_ccat(
     data_dir: str = "data",
     random_state: int = 42,
-    max_train_samples: int = 30_000,
-    max_test_samples: int = 10_000,
 ) -> Dict[str, np.ndarray]:
     data_path = Path(data_dir)
     tr_file = data_path / "rcv1_train.binary.bz2"
@@ -177,35 +175,25 @@ def load_ccat(
     _download(_URLS["ccat_train"], tr_file)
     _download(_URLS["ccat_test"], te_file)
 
-    print("[ccat] loading sparse train/test")
+    print("[ccat] loading sparse train/test (full)")
     X_train_sp, y_train = load_svmlight_file(str(tr_file))
-    X_test_sp, y_test = _load_svmlight_capped(
-        te_file,
-        n_features=X_train_sp.shape[1],
-        max_rows=max_test_samples,
-        random_state=random_state + 11,
-    )
+    X_test_sp, y_test = load_svmlight_file(str(te_file))
 
     X_train_sp, X_test_sp = _align_dims(X_train_sp, X_test_sp)
 
     y_train = _map_binary_labels(y_train)
     y_test = _map_binary_labels(y_test)
 
-    if len(y_train) > max_train_samples:
-        print(f"[ccat] subsampling train to {max_train_samples}")
+    # OOM protection: dense conversion of n*d floats > 8 GB → subsample train to 200k
+    dense_bytes = X_train_sp.shape[0] * X_train_sp.shape[1] * 8
+    if dense_bytes > 8 * (1 << 30):
+        max_safe = 200_000
+        print(f"[ccat] CCAT too large for dense ({dense_bytes / 1e9:.1f} GB), subsampling train to {max_safe}")
         rng = np.random.default_rng(random_state)
-        sel = rng.choice(len(y_train), size=max_train_samples, replace=False)
+        sel = rng.choice(len(y_train), size=min(max_safe, len(y_train)), replace=False)
         sel.sort()
         X_train_sp = X_train_sp[sel]
         y_train = y_train[sel]
-
-    if len(y_test) > max_test_samples:
-        print(f"[ccat] subsampling test to {max_test_samples}")
-        rng = np.random.default_rng(random_state + 1)
-        sel = rng.choice(len(y_test), size=max_test_samples, replace=False)
-        sel.sort()
-        X_test_sp = X_test_sp[sel]
-        y_test = y_test[sel]
 
     print("[ccat] sparse normalize + SVD projection")
     X_train_sp = _norm_sparse(X_train_sp)
@@ -224,8 +212,6 @@ def load_ccat(
 def load_covtype(
     data_dir: str = "data",
     random_state: int = 42,
-    max_train_samples: int = 20_000,
-    max_test_samples: int = 10_000,
 ) -> Dict[str, np.ndarray]:
     data_path = Path(data_dir)
     cov_file = data_path / "covtype.libsvm.binary.bz2"
@@ -252,20 +238,6 @@ def load_covtype(
         X_sp, y, test_size=0.2, random_state=random_state, stratify=y
     )
 
-    if len(y_train) > max_train_samples:
-        rng = np.random.default_rng(random_state)
-        idx = rng.choice(len(y_train), size=max_train_samples, replace=False)
-        idx.sort()
-        X_train_sp = X_train_sp[idx]
-        y_train = y_train[idx]
-
-    if len(y_test) > max_test_samples:
-        rng = np.random.default_rng(random_state + 1)
-        idx = rng.choice(len(y_test), size=max_test_samples, replace=False)
-        idx.sort()
-        X_test_sp = X_test_sp[idx]
-        y_test = y_test[idx]
-
     X_train = X_train_sp.toarray().astype(np.float32)
     X_test = X_test_sp.toarray().astype(np.float32)
     scaler = StandardScaler(with_mean=True, with_std=True)
@@ -281,7 +253,7 @@ def load_covtype(
 
 
 def load_dataset(name: str, data_dir: str = "data", random_state: int = 42) -> Dict[str, np.ndarray]:
-    if name == "astro-ph":
+    if name in ("astro-ph", "real-sim"):
         return load_astro_ph(data_dir=data_dir, random_state=random_state)
     if name == "ccat":
         return load_ccat(data_dir=data_dir, random_state=random_state)
