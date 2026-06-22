@@ -2,7 +2,12 @@
 .claude/
 CLAUDE.md
 
-# Dataset files (large binary/compressed — download via benchmark.py --download)
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Dataset files (large binary/compressed — download via scripts/download_data.py)
 data/
 
 # Python cache
@@ -11,5 +16,15 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Partial / fast-test results
+# Benchmark result outputs
 results_fast.csv
+# Note: results.csv may be tracked intentionally as a reference baseline.
+# Add it below if you want to exclude it:
+# results.csv
+
+# Write-once helper scripts (generated during setup)
+write_readme.py
+
+# OS / editor
+.DS_Store
+Thumbs.db

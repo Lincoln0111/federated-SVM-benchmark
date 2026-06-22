@@ -1,0 +1,9 @@
+# Runtime dependencies for the Federated SVM benchmark.
+# Standard-library modules (pathlib, os, sys, time, csv, argparse,
+# ssl, bz2, urllib, itertools, collections) are intentionally excluded.
+#
+# Install with:  pip install -r requirements.txt
+
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3

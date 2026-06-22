@@ -21,37 +21,48 @@ from pathlib import Path
 import numpy as np
 
 import benchmark as data_lib
+from config import CONFIG, DATA_DIR
 from methods import METHODS
 
 
 # ── Experiment grid ─────────────────────────────────────────────────────────
 
 SCHEMES = [
-    ("iid",         {}),
-    ("dirichlet",   {"alpha": 1.0}),
-    ("dirichlet",   {"alpha": 0.3}),
-    ("dirichlet",   {"alpha": 0.1}),
-    ("label_skew",  {}),
+    ("iid",        {}),
+    *[("dirichlet", {"alpha": a}) for a in CONFIG["DIRICHLET_ALPHAS"]],
+    ("label_skew", {}),
 ]
 
-FULL_DATASETS   = ["rcv1", "covtype"]
-FULL_CLIENTS    = [10, 50]
-FULL_ROUNDS     = 50
-FULL_MAX_TRAIN  = {"rcv1": None, "covtype": 50_000}   # covtype train: subsample to 50k
-FULL_MAX_TEST   = 20_000  # cap test eval — rcv1_test is 677k rows, evaluating all is slow
+FULL_DATASETS   = CONFIG["DATASETS"]
+FULL_CLIENTS    = [CONFIG["NUM_WORKERS"]]   # was [10, 50] sweep; aligned to NUM_WORKERS=10
+FULL_ROUNDS     = CONFIG["ROUNDS"]          # was 50; aligned to ROUNDS=100
+FULL_MAX_TRAIN  = CONFIG["MAX_TRAIN"]
+FULL_MAX_TEST   = CONFIG["MAX_TEST"]
 
-FAST_DATASETS   = ["rcv1"]
-FAST_CLIENTS    = [10]
-FAST_ROUNDS     = 10
-FAST_MAX_TRAIN  = 5_000
-FAST_MAX_TEST   = 2_000
+FAST_DATASETS   = CONFIG["FAST_DATASETS"]
+FAST_CLIENTS    = [CONFIG["NUM_WORKERS"]]
+FAST_ROUNDS     = CONFIG["FAST_ROUNDS"]
+FAST_MAX_TRAIN  = CONFIG["FAST_MAX_TRAIN"]
+FAST_MAX_TEST   = CONFIG["FAST_MAX_TEST"]
 
 METHOD_KWARGS = {
-    "centralized": {},
-    "fedavg_svm":  {"n_local_steps": 100, "lambda_reg": 0.01},
-    "bdsvm":       {"budget": 200, "n_local_steps": 100, "lambda_reg": 0.01, "rho": 1.0},
-    "fdr_svm":     {"n_local_steps": 100, "lambda_reg": 0.01, "rho": 1.0, "eps_scale": 1.0},
-    "fedssl_amc":  {"d_enc": 64, "svm_C": 1.0},
+    # centralized: explicitly pass CONFIG values (function defaults match,
+    # but CONFIG is the authoritative source for all experiment parameters)
+    "centralized": {"C":         CONFIG["CENTRALIZED_C"],
+                    "max_iter":  CONFIG["CENTRALIZED_MAX_ITER"],
+                    "subsample": CONFIG["CENTRALIZED_SUBSAMPLE"]},
+    "fedavg_svm":  {"n_local_steps": CONFIG["FEDAVG_LOCAL_STEPS"],
+                    "lambda_reg":    CONFIG["FEDAVG_LAMBDA"]},
+    "bdsvm":       {"P":   CONFIG["BDSVM_P"],
+                    "C":   CONFIG["BDSVM_C"],
+                    "lam": CONFIG["MOMENTUM_ALPHA"],
+                    "eta": CONFIG["IRWLS_ETA"]},
+    "fdr_svm":     {"n_local_steps": CONFIG["FDR_LOCAL_STEPS"],
+                    "lambda_reg":    CONFIG["FDR_LAMBDA"],
+                    "rho":           CONFIG["FDR_RHO"],
+                    "eps_scale":     CONFIG["FDR_EPS_SCALE"]},
+    "fedssl_amc":  {"d_enc":  CONFIG["FEDSSL_D_ENC"],
+                    "svm_C": CONFIG["FEDSSL_SVM_C"]},
 }
 
 
@@ -87,15 +98,15 @@ def run_method(name, module, X_tr, y_tr, X_te, y_te, client_idx, n_rounds, seed)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", default="./data")
+    ap.add_argument("--data-dir", default=str(DATA_DIR))
     ap.add_argument("--download", action="store_true",
                     help="Download datasets before running")
     ap.add_argument("--fast", action="store_true",
                     help="Quick smoke-test: small subsets, fewer rounds")
     ap.add_argument("--datasets", nargs="+", default=None)
     ap.add_argument("--methods",  nargs="+", default=None)
-    ap.add_argument("--out", default="results.csv")
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--out", default=str(CONFIG["RESULTS_PATH"]))
+    ap.add_argument("--seed", type=int, default=CONFIG["SEED"])
     args = ap.parse_args()
 
     data_dir = args.data_dir
@@ -106,7 +117,12 @@ def main():
 
     fast       = args.fast
     datasets   = args.datasets or (FAST_DATASETS if fast else FULL_DATASETS)
-    all_methods = args.methods  or list(METHODS.keys())
+    # "--methods all" or no --methods flag → run every registered method
+    all_methods = (
+        list(METHODS.keys())
+        if (args.methods is None or args.methods == ["all"])
+        else args.methods
+    )
     n_clients_list = FAST_CLIENTS if fast else FULL_CLIENTS
     n_rounds   = FAST_ROUNDS if fast else FULL_ROUNDS
     max_test   = FAST_MAX_TEST  if fast else FULL_MAX_TEST
