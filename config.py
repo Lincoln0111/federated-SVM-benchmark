@@ -111,3 +111,17 @@ CONFIG = {
     # ── Output ─────────────────────────────────────────────────────────────
     "RESULTS_PATH":  CODE_DIR / "results.csv",
 }
+
+INACTIVE_ALIGNMENT_FIELDS = {
+    "TOPOLOGY",
+    "EPOCHS",
+    "BASE_PORT",
+    "GOSSIP_K",
+}
+
+CONFIG_ALIGNMENT_NOTE = (
+    "TOPOLOGY, EPOCHS, BASE_PORT, and GOSSIP_K are retained only for structural "
+    "alignment with Sreekar's p2p-SDCA branch and future CCR/HPC adaptation. "
+    "The current benchmark remains a Python local simulation with no active "
+    "TCP, gRPC, socket, or p2pfl backend."
+)

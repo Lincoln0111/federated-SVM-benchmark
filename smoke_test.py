@@ -1,4 +1,4 @@
-from config import CONFIG
+from config import CONFIG, CONFIG_ALIGNMENT_NOTE, INACTIVE_ALIGNMENT_FIELDS
 import run_benchmark as rb
 
 print("=== Team alignment ===")
@@ -14,6 +14,13 @@ assert CONFIG["FUTURE_TARGET_ENV"]     == "CCR_HPC"
 print("COMMUNICATION_BACKEND =", CONFIG["COMMUNICATION_BACKEND"], " OK")
 print("EXECUTION_MODE        =", CONFIG["EXECUTION_MODE"], " OK")
 print("FUTURE_TARGET_ENV     =", CONFIG["FUTURE_TARGET_ENV"], " OK")
+
+print("\n=== Placeholder alignment fields ===")
+assert INACTIVE_ALIGNMENT_FIELDS == {"TOPOLOGY", "EPOCHS", "BASE_PORT", "GOSSIP_K"}
+for key in sorted(INACTIVE_ALIGNMENT_FIELDS):
+    assert key in CONFIG
+    print(" ", key, "=", CONFIG[key], " placeholder")
+print(CONFIG_ALIGNMENT_NOTE)
 
 print("\n=== Reference values absent ===")
 assert "LAMBDA"      not in CONFIG
